@@ -1,0 +1,1 @@
+add_mlxgym_task(matrix_copy)

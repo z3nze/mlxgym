@@ -1,0 +1,1 @@
+add_mlxgym_task(swish_gated_linear_unit)

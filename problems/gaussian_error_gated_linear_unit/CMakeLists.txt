@@ -1,0 +1,1 @@
+add_mlxgym_task(gaussian_error_gated_linear_unit)

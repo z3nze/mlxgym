@@ -1,0 +1,1 @@
+add_mlxgym_task(reverse_array)

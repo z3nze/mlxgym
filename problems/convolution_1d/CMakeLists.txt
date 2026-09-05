@@ -1,0 +1,1 @@
+add_mlxgym_task(convolution_1d)
