@@ -303,6 +303,92 @@ int test_matmul(MetalContext &context, PipelineHandle pipeline) {
   return finish("matrix_multiplication", log);
 }
 
+int test_softmax_attention(MetalContext &context, PipelineHandle pipeline) {
+  TestLog log;
+  struct Shape {
+    std::uint32_t m, n, d;
+  };
+  const std::vector<Shape> shapes{{1, 1, 1}, {1, 3, 2},  {3, 1, 5},    {2, 3, 4},
+                                  {3, 5, 7}, {7, 9, 16}, {17, 13, 31}, {33, 35, 17}};
+
+  for (std::size_t case_index = 0; case_index < shapes.size(); ++case_index) {
+    const auto shape = shapes[case_index];
+    const std::size_t q_count = std::size_t(shape.m) * shape.d;
+    const std::size_t kv_count = std::size_t(shape.n) * shape.d;
+    std::vector<float> q_values(q_count), k_values(kv_count), v_values(kv_count);
+    for (std::size_t i = 0; i < q_count; ++i)
+      q_values[i] = 0.75F * std::sin(float(i) * 0.37F + 0.11F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      k_values[i] = 0.8F * std::cos(float(i) * 0.23F - 0.19F);
+      v_values[i] = std::sin(float(i) * 0.13F) - 0.3F * std::cos(float(i) * 0.41F);
+    }
+    // Exercise stable softmax rather than allowing an implementation to rely on small logits.
+    if (case_index + 1 == shapes.size()) {
+      for (float &value : q_values)
+        value *= 8.0F;
+      for (float &value : k_values)
+        value *= 8.0F;
+    }
+
+    std::vector<float> expected(q_count);
+    std::vector<double> scores(shape.n);
+    const double scale = 1.0 / std::sqrt(double(shape.d));
+    for (std::uint32_t row = 0; row < shape.m; ++row) {
+      double maximum = -std::numeric_limits<double>::infinity();
+      for (std::uint32_t key = 0; key < shape.n; ++key) {
+        double dot = 0.0;
+        for (std::uint32_t col = 0; col < shape.d; ++col)
+          dot += double(q_values[std::size_t(row) * shape.d + col]) *
+                 k_values[std::size_t(key) * shape.d + col];
+        scores[key] = dot * scale;
+        maximum = std::max(maximum, scores[key]);
+      }
+      double denominator = 0.0;
+      for (double &score : scores) {
+        score = std::exp(score - maximum);
+        denominator += score;
+      }
+      for (std::uint32_t col = 0; col < shape.d; ++col) {
+        double value = 0.0;
+        for (std::uint32_t key = 0; key < shape.n; ++key)
+          value += (scores[key] / denominator) * v_values[std::size_t(key) * shape.d + col];
+        expected[std::size_t(row) * shape.d + col] = float(value);
+      }
+    }
+
+    GuardedBuffer<float> q(q_count), k(kv_count), v(kv_count), output(q_count, kNaN);
+    load(q, q_values);
+    load(k, k_values);
+    load(v, v_values);
+    q.upload(context);
+    k.upload(context);
+    v.upload(context);
+    output.upload(context);
+    Invocation invocation{{q.slice(), k.slice(), v.slice(), output.slice()},
+                          constants(shape.m, shape.n, shape.d),
+                          {shape.d, shape.m, 1}};
+    encode_solution(context, pipeline, invocation);
+    q.download(context);
+    k.download(context);
+    v.download(context);
+    output.download(context);
+
+    const std::string label = "softmax_attention shape=" + std::to_string(shape.m) + "x" +
+                              std::to_string(shape.n) + "x" + std::to_string(shape.d);
+    log.expect(q.guards_intact() && k.guards_intact() && v.guards_intact() &&
+                   output.guards_intact(),
+               label + " guard regions");
+    log.expect(std::equal(q.data(), q.data() + q_count, q_values.begin()) &&
+                   std::equal(k.data(), k.data() + kv_count, k_values.begin()) &&
+                   std::equal(v.data(), v.data() + kv_count, v_values.begin()),
+               label + " input immutability");
+    for (std::size_t i = 0; i < q_count; ++i)
+      log.expect(close(output.data()[i], expected[i], 1.5e-3F, 2.0e-4F),
+                 label + " index=" + std::to_string(i));
+  }
+  return finish("softmax_attention", log);
+}
+
 int test_color(MetalContext &context, PipelineHandle pipeline) {
   TestLog log;
   const std::vector<std::pair<std::uint32_t, std::uint32_t>> shapes{{1, 1},   {1, 2},   {2, 1},
@@ -745,6 +831,25 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
     }
     return 0;
   }
+  if (task == "softmax_attention") {
+    for (const auto shape :
+         {std::array<std::uint32_t, 3>{128, 128, 64}, std::array<std::uint32_t, 3>{512, 512, 64},
+          std::array<std::uint32_t, 3>{1024, 1024, 128}}) {
+      const auto [m, n, d] = shape;
+      const std::size_t q_count = std::size_t(m) * d;
+      const std::size_t kv_count = std::size_t(n) * d;
+      auto q = buffer(q_count * 4), k = buffer(kv_count * 4), v = buffer(kv_count * 4);
+      auto output = buffer(q_count * 4);
+      Invocation inv{{{q, 0}, {k, 0}, {v, 0}, {output, 0}}, constants(m, n, d), {d, m, 1}};
+      const std::string label =
+          "M=" + std::to_string(m) + " N=" + std::to_string(n) + " d=" + std::to_string(d);
+      const double flops = 4.0 * double(m) * n * d;
+      const double bytes = 4.0 * (q_count * 2.0 + kv_count * 2.0);
+      print_bench(task, label, m == 1024 && n == 1024 && d == 128, context, pipeline, inv, q_count,
+                  bytes, flops);
+    }
+    return 0;
+  }
   if (task == "color_inversion" || task == "rgb_to_grayscale") {
     for (const auto shape :
          {std::pair{1920u, 1080u}, std::pair{3840u, 2160u}, std::pair{1919u, 1079u}}) {
@@ -839,6 +944,8 @@ int run_correctness(const std::string &task, MetalContext &context, PipelineHand
     return test_transpose(context, pipeline);
   if (task == "matrix_multiplication")
     return test_matmul(context, pipeline);
+  if (task == "softmax_attention")
+    return test_softmax_attention(context, pipeline);
   if (task == "color_inversion")
     return test_color(context, pipeline);
   if (task == "rgb_to_grayscale")

@@ -1,0 +1,1 @@
+add_mlxgym_task(softmax_attention)

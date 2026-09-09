@@ -37,7 +37,7 @@ set(MLXGYM_TASKS
   matrix_addition convolution_1d reverse_array relu leaky_relu rainbow_table
   matrix_copy sigmoid_linear_unit swish_gated_linear_unit value_clipping
   interleave_arrays gaussian_error_gated_linear_unit rgb_to_grayscale
-  sigmoid_activation reduction softmax convolution_2d batch_normalization)
+  sigmoid_activation reduction softmax softmax_attention convolution_2d batch_normalization)
 
 foreach(task IN LISTS MLXGYM_TASKS)
   add_subdirectory(problems/${task})
