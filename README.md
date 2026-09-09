@@ -1,12 +1,6 @@
 # mlxgym
 
 A local Apple-silicon GPU practice gym for writing native Metal compute kernels.
-It mirrors the 22 mathematical problems in `l33tgpu`, but contains no CUDA
-kernel implementations and requires no remote machine.
-
-Every `problems/<task>/kernel.metal` is an intentionally non-solving stub. The
-corresponding executable compiles and runs, but its correctness tests fail until
-you implement the Metal algorithm.
 
 ## Requirements
 
@@ -35,6 +29,18 @@ Tests cover deterministic randomized inputs, hand-picked numerical cases,
 SIMD/workgroup boundaries, odd shapes, output sentinels, and buffer guard zones.
 Benchmarks refuse to run until correctness passes, warm up the GPU, and report
 median and p95 GPU execution time from Metal command-buffer timestamps.
+
+<!-- MLXGYM_BENCHMARKS_START -->
+## M4 MacBook Air records
+
+Best results from the representative workload for each task. Running
+`./scripts/benchmark-task.sh <task>` replaces a record when its median GPU time improves.
+
+| Task | Workload | Best median | p95 | Throughput | Recorded | Source |
+|---|---:|---:|---:|---:|---:|---:|
+| [Value clipping](problems/value_clipping/README.md) | 16777216 elements | 1.935 ms | 2.368 ms | 69.37 GB/s | 2026-09-09 | `b23db4305f0e+dirty` |
+| [Vector add](problems/vector_add/README.md) | 16777216 elements | 2.779 ms | 4.387 ms | 72.45 GB/s | 2026-09-09 | `b23db4305f0e+dirty` |
+<!-- MLXGYM_BENCHMARKS_END -->
 
 `profile-task.sh` writes an Xcode `.gputrace` under `build/profiles/` using
 Metal's programmatic capture API.

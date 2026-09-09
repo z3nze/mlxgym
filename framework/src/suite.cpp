@@ -2,6 +2,8 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <numeric>
@@ -609,8 +611,19 @@ struct BenchBuffers {
   double flops{};
 };
 
-void print_bench(const std::string &label, MetalContext &context, PipelineHandle pipeline,
-                 const Invocation &invocation, double units, double bytes, double flops) {
+void append_benchmark_record(const std::string &line) {
+  const char *path = std::getenv("MLXGYM_BENCHMARK_RECORD_FILE");
+  if (!path || !*path)
+    return;
+  std::ofstream output(path, std::ios::app);
+  if (!output)
+    throw std::runtime_error("Unable to write benchmark record file");
+  output << line << '\n';
+}
+
+void print_bench(const std::string &task, const std::string &label, bool primary,
+                 MetalContext &context, PipelineHandle pipeline, const Invocation &invocation,
+                 double units, double bytes, double flops) {
   for (int i = 0; i < 5; ++i)
     encode_solution(context, pipeline, invocation);
   std::vector<double> samples;
@@ -618,7 +631,8 @@ void print_bench(const std::string &label, MetalContext &context, PipelineHandle
     samples.push_back(encode_solution(context, pipeline, invocation).gpu_seconds);
   std::sort(samples.begin(), samples.end());
   const double sec = samples[samples.size() / 2];
-  const double p95 = samples[static_cast<std::size_t>(samples.size() * .95) - 1];
+  const std::size_t p95_index = (samples.size() * 95 + 99) / 100 - 1;
+  const double p95 = samples[p95_index];
   std::cout << std::left << std::setw(24) << label << " median=" << std::fixed
             << std::setprecision(3) << sec * 1e6 << " us p95=" << p95 * 1e6 << " us";
   if (bytes > 0)
@@ -628,6 +642,14 @@ void print_bench(const std::string &label, MetalContext &context, PipelineHandle
   if (units > 0)
     std::cout << "  " << units / sec / 1e6 << " Munit/s";
   std::cout << '\n';
+
+  // A stable, tab-separated record for scripts. Keep the normal output above pleasant for humans.
+  std::ostringstream record;
+  record << std::setprecision(17) << "MLXGYM_BENCH_V1\t" << task << '\t' << label << '\t'
+         << (primary ? 1 : 0) << '\t' << sec * 1e6 << '\t' << p95 * 1e6 << '\t'
+         << (bytes > 0 ? bytes / sec / 1e9 : 0.0) << '\t' << (flops > 0 ? flops / sec / 1e9 : 0.0)
+         << '\t' << (units > 0 ? units / sec / 1e6 : 0.0);
+  append_benchmark_record(record.str());
 }
 
 int benchmark_task(const std::string &task, MetalContext &context, PipelineHandle pipeline) {
@@ -636,8 +658,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
                     std::size_t grid, double byte_count, double flop_count = 0.0,
                     const std::string &suffix = " elements") {
     Invocation inv{std::move(buffers), std::move(args), {grid, 1, 1}};
-    print_bench(std::to_string(n) + suffix, context, pipeline, inv, double(n), byte_count,
-                flop_count);
+    print_bench(task, std::to_string(n) + suffix, n == (std::size_t(1) << 24), context, pipeline,
+                inv, double(n), byte_count, flop_count);
   };
 
   const bool plain_unary = task == "relu" || task == "leaky_relu" || task == "sigmoid_activation" ||
@@ -696,8 +718,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       }
       bs.push_back({out, 0});
       Invocation inv{bs, constants(n), {n, n, 1}};
-      print_bench(std::to_string(n) + "x" + std::to_string(n), context, pipeline, inv, count, bytes,
-                  0);
+      print_bench(task, std::to_string(n) + "x" + std::to_string(n), n == 4096, context, pipeline,
+                  inv, count, bytes, 0);
     }
     return 0;
   }
@@ -708,8 +730,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       const std::size_t n = std::size_t(r) * c;
       auto in = buffer(n * 4), out = buffer(n * 4);
       Invocation inv{{{in, 0}, {out, 0}}, constants(r, c), {c, r, 1}};
-      print_bench(std::to_string(r) + "x" + std::to_string(c), context, pipeline, inv, n, n * 8.0,
-                  0);
+      print_bench(task, std::to_string(r) + "x" + std::to_string(c), r == 4096 && c == 1024,
+                  context, pipeline, inv, n, n * 8.0, 0);
     }
     return 0;
   }
@@ -718,7 +740,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       const std::size_t count = std::size_t(n) * n;
       auto a = buffer(count * 4), b = buffer(count * 4), out = buffer(count * 4);
       Invocation inv{{{a, 0}, {b, 0}, {out, 0}}, constants(n, n, n), {n, n, 1}};
-      print_bench(std::to_string(n) + " cubed", context, pipeline, inv, count, 0, 2.0 * n * n * n);
+      print_bench(task, std::to_string(n) + " cubed", n == 1024, context, pipeline, inv, count, 0,
+                  2.0 * n * n * n);
     }
     return 0;
   }
@@ -730,13 +753,13 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       if (task == "color_inversion") {
         auto image = buffer(pixels * 4);
         Invocation inv{{{image, 0}}, constants(w, h), {pixels, 1, 1}};
-        print_bench(std::to_string(w) + "x" + std::to_string(h), context, pipeline, inv, pixels,
-                    pixels * 8.0, 0);
+        print_bench(task, std::to_string(w) + "x" + std::to_string(h), w == 3840 && h == 2160,
+                    context, pipeline, inv, pixels, pixels * 8.0, 0);
       } else {
         auto in = buffer(pixels * 12), out = buffer(pixels * 4);
         Invocation inv{{{in, 0}, {out, 0}}, constants(w, h), {pixels, 1, 1}};
-        print_bench(std::to_string(w) + "x" + std::to_string(h), context, pipeline, inv, pixels,
-                    pixels * 16.0, 0);
+        print_bench(task, std::to_string(w) + "x" + std::to_string(h), w == 3840 && h == 2160,
+                    context, pipeline, inv, pixels, pixels * 16.0, 0);
       }
     }
     return 0;
@@ -747,7 +770,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       const std::size_t out_n = n - k + 1;
       auto in = buffer(n * 4), weights = buffer(k * 4), out = buffer(out_n * 4);
       Invocation inv{{{in, 0}, {weights, 0}, {out, 0}}, constants(n, k), {out_n, 1, 1}};
-      print_bench("N=1M K=" + std::to_string(k), context, pipeline, inv, out_n, 0, 2.0 * out_n * k);
+      print_bench(task, "N=1M K=" + std::to_string(k), k == 127, context, pipeline, inv, out_n, 0,
+                  2.0 * out_n * k);
     }
     return 0;
   }
@@ -758,8 +782,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
         const std::size_t in_n = std::size_t(side) * side, out_n = std::size_t(os) * os;
         auto in = buffer(in_n * 4), weights = buffer(k * k * 4), out = buffer(out_n * 4);
         Invocation inv{{{in, 0}, {weights, 0}, {out, 0}}, constants(side, side, k, k), {os, os, 1}};
-        print_bench(std::to_string(side) + "^2 K=" + std::to_string(k), context, pipeline, inv,
-                    out_n, 0, 2.0 * out_n * k * k);
+        print_bench(task, std::to_string(side) + "^2 K=" + std::to_string(k),
+                    side == 1024 && k == 7, context, pipeline, inv, out_n, 0, 2.0 * out_n * k * k);
       }
     }
     return 0;
@@ -769,7 +793,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
     for (const std::uint32_t r : {1u, 100u, 1000u}) {
       auto in = buffer(n * 4), out = buffer(n * 4);
       Invocation inv{{{in, 0}, {out, 0}}, constants(n, r), {n, 1, 1}};
-      print_bench("N=1M R=" + std::to_string(r), context, pipeline, inv, double(n) * r, n * 8.0, 0);
+      print_bench(task, "N=1M R=" + std::to_string(r), r == 1000, context, pipeline, inv,
+                  double(n) * r, n * 8.0, 0);
     }
     return 0;
   }
@@ -778,8 +803,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       const auto count = static_cast<std::uint32_t>(n);
       auto in = buffer(n * 4), out = buffer((task == "reduction" ? 1 : n) * 4);
       Invocation inv{{{in, 0}, {out, 0}}, constants(count), {n, 1, 1}};
-      print_bench(std::to_string(n) + " elements", context, pipeline, inv, n,
-                  n * 4.0 + (task == "reduction" ? 4.0 : n * 4.0), 0);
+      print_bench(task, std::to_string(n) + " elements", n == (std::size_t(1) << 24), context,
+                  pipeline, inv, n, n * 4.0 + (task == "reduction" ? 4.0 : n * 4.0), 0);
     }
     return 0;
   }
@@ -791,8 +816,8 @@ int benchmark_task(const std::string &task, MetalContext &context, PipelineHandl
       auto in = buffer(count * 4), g = buffer(c * 4), b = buffer(c * 4), out = buffer(count * 4);
       const float eps = 1e-5F;
       Invocation inv{{{in, 0}, {g, 0}, {b, 0}, {out, 0}}, constants(n, c, eps), {c, n, 1}};
-      print_bench(std::to_string(n) + "x" + std::to_string(c), context, pipeline, inv, count,
-                  count * 8.0 + c * 8.0, 0);
+      print_bench(task, std::to_string(n) + "x" + std::to_string(c), n == 8192 && c == 1024,
+                  context, pipeline, inv, count, count * 8.0 + c * 8.0, 0);
     }
     return 0;
   }
@@ -864,6 +889,7 @@ int run_task(const std::string &task, MetalContext &context, PipelineHandle pipe
   if (correctness || !benchmark)
     return correctness;
   std::cout << "Benchmarking on " << context.device_name() << "\n";
+  append_benchmark_record("MLXGYM_DEVICE_V1\t" + context.device_name());
   return benchmark_task(task, context, pipeline);
 }
 
